@@ -1,1 +1,914 @@
+# ============================================================
+# XAI-Lite vs ResNet50 + Grad-CAM Benchmark Script
+# ============================================================
+# Metrics:
+# - Accuracy
+# - Macro F1
+# - Weighted F1
+# - Parameters
+# - Model size
+# - FLOPs / MACs
+# - Classification latency
+# - Explanation latency
+# - Total latency
+# - Peak GPU memory
+#
+# Recommended:
+# Batch size = 1
+# Warm-up runs = 30
+# Benchmark runs = 100
+# Input size = 224 x 224
+# ============================================================
 
+import os
+import time
+import copy
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
+
+from sklearn.metrics import accuracy_score, f1_score
+
+# Optional FLOPs profiler
+try:
+    from thop import profile
+    THOP_AVAILABLE = True
+except ImportError:
+    THOP_AVAILABLE = False
+    print("WARNING: thop not installed.")
+    print("Install using: pip install thop")
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+NUM_CLASSES = 7
+IMAGE_SIZE = 224
+BATCH_SIZE = 1
+
+WARMUP_RUNS = 30
+BENCHMARK_RUNS = 100
+
+# CHANGE THESE PATHS
+XAI_LITE_CHECKPOINT = "xai_lite.pth"
+RESNET50_CHECKPOINT = "resnet50_baseline.pth"
+
+# Dataset structure should be:
+#
+# test_data/
+#     akiec/
+#     bcc/
+#     bkl/
+#     df/
+#     mel/
+#     nv/
+#     vasc/
+#
+TEST_DATA_DIR = "test_data"
+
+CLASS_NAMES = [
+    "akiec",
+    "bcc",
+    "bkl",
+    "df",
+    "mel",
+    "nv",
+    "vasc"
+]
+
+print("\nUsing device:", DEVICE)
+
+
+# ============================================================
+# 2. SYNCHRONIZATION FUNCTION
+# ============================================================
+
+def synchronize_device():
+    """
+    Ensures CUDA operations are completed before timing.
+    """
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+
+# ============================================================
+# 3. LOAD TEST DATA
+# ============================================================
+
+test_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+test_dataset = datasets.ImageFolder(
+    TEST_DATA_DIR,
+    transform=test_transform
+)
+
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True
+)
+
+print("Test samples:", len(test_dataset))
+print("Detected classes:", test_dataset.classes)
+
+
+# ============================================================
+# 4. MODEL LOADING
+# ============================================================
+
+def load_xai_lite():
+
+    # MobileNetV3-Large backbone
+    model = models.mobilenet_v3_large(weights=None)
+
+    # Replace final classifier for 7 classes
+    model.classifier[3] = nn.Linear(
+        model.classifier[3].in_features,
+        NUM_CLASSES
+    )
+
+    checkpoint = torch.load(
+        XAI_LITE_CHECKPOINT,
+        map_location=DEVICE
+    )
+
+    # Supports both direct state_dict and checkpoint dictionaries
+    if "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
+
+    model = model.to(DEVICE)
+    model.eval()
+
+    return model
+
+
+def load_resnet50():
+
+    model = models.resnet50(weights=None)
+
+    model.fc = nn.Linear(
+        model.fc.in_features,
+        NUM_CLASSES
+    )
+
+    checkpoint = torch.load(
+        RESNET50_CHECKPOINT,
+        map_location=DEVICE
+    )
+
+    if "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        model.load_state_dict(checkpoint)
+
+    model = model.to(DEVICE)
+    model.eval()
+
+    return model
+
+
+# ============================================================
+# 5. PARAMETERS
+# ============================================================
+
+def count_parameters(model):
+
+    total = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+    )
+
+    return total
+
+
+# ============================================================
+# 6. MODEL SIZE
+# ============================================================
+
+def get_model_size_mb(model, filename):
+
+    torch.save(
+        model.state_dict(),
+        filename
+    )
+
+    size_mb = (
+        os.path.getsize(filename)
+        / (1024 ** 2)
+    )
+
+    os.remove(filename)
+
+    return size_mb
+
+
+# ============================================================
+# 7. FLOPS / MACs
+# ============================================================
+
+def calculate_flops(model):
+
+    if not THOP_AVAILABLE:
+        return None, None
+
+    model_copy = copy.deepcopy(model).cpu()
+    model_copy.eval()
+
+    dummy_input = torch.randn(
+        1,
+        3,
+        IMAGE_SIZE,
+        IMAGE_SIZE
+    )
+
+    macs, params = profile(
+        model_copy,
+        inputs=(dummy_input,),
+        verbose=False
+    )
+
+    # Common approximation:
+    # FLOPs ≈ 2 × MACs
+    flops = 2 * macs
+
+    return macs, flops
+
+
+# ============================================================
+# 8. CLASSIFICATION LATENCY
+# ============================================================
+
+def benchmark_classification_latency(
+    model,
+    sample_input
+):
+
+    # Warm-up
+    with torch.no_grad():
+
+        for _ in range(WARMUP_RUNS):
+
+            _ = model(sample_input)
+
+    synchronize_device()
+
+    latencies = []
+
+    with torch.no_grad():
+
+        for _ in range(BENCHMARK_RUNS):
+
+            synchronize_device()
+
+            start = time.perf_counter()
+
+            _ = model(sample_input)
+
+            synchronize_device()
+
+            end = time.perf_counter()
+
+            latency_ms = (
+                end - start
+            ) * 1000
+
+            latencies.append(latency_ms)
+
+    return {
+        "mean_ms": float(np.mean(latencies)),
+        "std_ms": float(np.std(latencies)),
+        "median_ms": float(np.median(latencies))
+    }
+
+
+# ============================================================
+# 9. GRAD-CAM IMPLEMENTATION
+# ============================================================
+
+class GradCAM:
+
+    def __init__(
+        self,
+        model,
+        target_layer
+    ):
+
+        self.model = model
+        self.target_layer = target_layer
+
+        self.activations = None
+        self.gradients = None
+
+        self.forward_handle = (
+            target_layer.register_forward_hook(
+                self.forward_hook
+            )
+        )
+
+        self.backward_handle = (
+            target_layer.register_full_backward_hook(
+                self.backward_hook
+            )
+        )
+
+
+    def forward_hook(
+        self,
+        module,
+        inputs,
+        output
+    ):
+
+        self.activations = output
+
+
+    def backward_hook(
+        self,
+        module,
+        grad_input,
+        grad_output
+    ):
+
+        self.gradients = grad_output[0]
+
+
+    def generate(
+        self,
+        input_tensor,
+        target_class=None
+    ):
+
+        self.model.zero_grad()
+
+        output = self.model(input_tensor)
+
+        if target_class is None:
+
+            target_class = torch.argmax(
+                output,
+                dim=1
+            )
+
+        target_score = output[
+            0,
+            target_class.item()
+        ]
+
+        target_score.backward()
+
+        # Global average pooling of gradients
+        weights = torch.mean(
+            self.gradients,
+            dim=(2, 3),
+            keepdim=True
+        )
+
+        # Weighted activation maps
+        cam = torch.sum(
+            weights * self.activations,
+            dim=1
+        )
+
+        cam = torch.relu(cam)
+
+        # Normalize
+        cam_min = cam.min()
+        cam_max = cam.max()
+
+        cam = (
+            cam - cam_min
+        ) / (
+            cam_max - cam_min + 1e-8
+        )
+
+        return cam.detach()
+
+
+    def remove_hooks(self):
+
+        self.forward_handle.remove()
+        self.backward_handle.remove()
+
+
+# ============================================================
+# 10. BENCHMARK EXPLANATION LATENCY
+# ============================================================
+
+def benchmark_gradcam_latency(
+    gradcam,
+    sample_input
+):
+
+    # Warm-up
+    for _ in range(WARMUP_RUNS):
+
+        _ = gradcam.generate(
+            sample_input
+        )
+
+    synchronize_device()
+
+    latencies = []
+
+    for _ in range(BENCHMARK_RUNS):
+
+        synchronize_device()
+
+        start = time.perf_counter()
+
+        _ = gradcam.generate(
+            sample_input
+        )
+
+        synchronize_device()
+
+        end = time.perf_counter()
+
+        latency_ms = (
+            end - start
+        ) * 1000
+
+        latencies.append(latency_ms)
+
+    return {
+        "mean_ms": float(np.mean(latencies)),
+        "std_ms": float(np.std(latencies)),
+        "median_ms": float(np.median(latencies))
+    }
+
+
+# ============================================================
+# 11. PEAK GPU MEMORY
+# ============================================================
+
+def measure_peak_memory(
+    model,
+    sample_input,
+    explanation_function=None
+):
+
+    if DEVICE.type != "cuda":
+
+        return None
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    if explanation_function is None:
+
+        with torch.no_grad():
+
+            _ = model(sample_input)
+
+    else:
+
+        _ = explanation_function(
+            sample_input
+        )
+
+    synchronize_device()
+
+    peak_memory = (
+        torch.cuda.max_memory_allocated()
+        / (1024 ** 2)
+    )
+
+    return float(peak_memory)
+
+
+# ============================================================
+# 12. CLASSIFICATION EVALUATION
+# ============================================================
+
+def evaluate_model(
+    model,
+    data_loader
+):
+
+    predictions = []
+    labels = []
+
+    model.eval()
+
+    with torch.no_grad():
+
+        for images, targets in data_loader:
+
+            images = images.to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            targets = targets.to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            outputs = model(images)
+
+            predicted = torch.argmax(
+                outputs,
+                dim=1
+            )
+
+            predictions.extend(
+                predicted.cpu().numpy()
+            )
+
+            labels.extend(
+                targets.cpu().numpy()
+            )
+
+    accuracy = accuracy_score(
+        labels,
+        predictions
+    )
+
+    macro_f1 = f1_score(
+        labels,
+        predictions,
+        average="macro",
+        zero_division=0
+    )
+
+    weighted_f1 = f1_score(
+        labels,
+        predictions,
+        average="weighted",
+        zero_division=0
+    )
+
+    return {
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1
+    }
+
+
+# ============================================================
+# 13. MAIN BENCHMARK FUNCTION
+# ============================================================
+
+def benchmark_model(
+    model,
+    model_name,
+    sample_input,
+    explanation_method=None
+):
+
+    print("\n")
+    print("=" * 60)
+    print("BENCHMARKING:", model_name)
+    print("=" * 60)
+
+    # --------------------------
+    # Parameters
+    # --------------------------
+
+    parameters = count_parameters(model)
+
+    print(
+        "Parameters:",
+        f"{parameters / 1e6:.2f} M"
+    )
+
+    # --------------------------
+    # Model Size
+    # --------------------------
+
+    safe_name = (
+        model_name
+        .replace(" ", "_")
+        .replace("+", "plus")
+    )
+
+    model_size = get_model_size_mb(
+        model,
+        safe_name + ".pth"
+    )
+
+    print(
+        "Model size:",
+        f"{model_size:.2f} MB"
+    )
+
+    # --------------------------
+    # FLOPs
+    # --------------------------
+
+    macs, flops = calculate_flops(model)
+
+    if macs is not None:
+
+        print(
+            "MACs:",
+            f"{macs / 1e9:.3f} GMACs"
+        )
+
+        print(
+            "Approx. FLOPs:",
+            f"{flops / 1e9:.3f} GFLOPs"
+        )
+
+    # --------------------------
+    # Classification latency
+    # --------------------------
+
+    classification_latency = (
+        benchmark_classification_latency(
+            model,
+            sample_input
+        )
+    )
+
+    print(
+        "Classification latency:",
+        f"{classification_latency['mean_ms']:.3f} ms"
+    )
+
+    # --------------------------
+    # Classification memory
+    # --------------------------
+
+    classification_memory = (
+        measure_peak_memory(
+            model,
+            sample_input
+        )
+    )
+
+    # --------------------------
+    # Explanation latency
+    # --------------------------
+
+    explanation_latency = None
+    explanation_memory = None
+
+    if explanation_method is not None:
+
+        explanation_latency = (
+            benchmark_gradcam_latency(
+                explanation_method,
+                sample_input
+            )
+        )
+
+        explanation_memory = (
+            measure_peak_memory(
+                model,
+                sample_input,
+                explanation_method.generate
+            )
+        )
+
+        print(
+            "Explanation latency:",
+            f"{explanation_latency['mean_ms']:.3f} ms"
+        )
+
+    # --------------------------
+    # Total latency
+    # --------------------------
+
+    total_latency = None
+
+    if explanation_latency is not None:
+
+        total_latency = (
+            classification_latency["mean_ms"]
+            + explanation_latency["mean_ms"]
+        )
+
+        print(
+            "Total latency:",
+            f"{total_latency:.3f} ms"
+        )
+
+    return {
+        "Model": model_name,
+        "Parameters_M":
+            parameters / 1e6,
+
+        "Model_Size_MB":
+            model_size,
+
+        "MACs_G":
+            macs / 1e9
+            if macs else None,
+
+        "FLOPs_G":
+            flops / 1e9
+            if flops else None,
+
+        "Classification_Latency_ms":
+            classification_latency["mean_ms"],
+
+        "Classification_Std_ms":
+            classification_latency["std_ms"],
+
+        "Explanation_Latency_ms":
+            explanation_latency["mean_ms"]
+            if explanation_latency
+            else None,
+
+        "Total_Latency_ms":
+            total_latency,
+
+        "Classification_Peak_Memory_MB":
+            classification_memory,
+
+        "Explanation_Peak_Memory_MB":
+            explanation_memory
+    }
+
+
+# ============================================================
+# 14. LOAD MODELS
+# ============================================================
+
+xai_lite_model = load_xai_lite()
+
+resnet50_model = load_resnet50()
+
+
+# ============================================================
+# 15. SELECT SAMPLE INPUT
+# ============================================================
+
+sample_image, _ = test_dataset[0]
+
+sample_input = (
+    sample_image
+    .unsqueeze(0)
+    .to(DEVICE)
+)
+
+
+# ============================================================
+# 16. SELECT GRAD-CAM TARGET LAYERS
+# ============================================================
+
+# ResNet50 final convolutional layer
+resnet_target_layer = (
+    resnet50_model.layer4[-1].conv3
+)
+
+resnet_gradcam = GradCAM(
+    resnet50_model,
+    resnet_target_layer
+)
+
+
+# XAI-Lite target layer
+#
+# IMPORTANT:
+# You must verify the correct final convolutional
+# layer for your MobileNetV3-Large implementation.
+#
+# A common choice is:
+xai_target_layer = (
+    xai_lite_model.features[-1]
+)
+
+xai_gradcam = GradCAM(
+    xai_lite_model,
+    xai_target_layer
+)
+
+
+# ============================================================
+# 17. BENCHMARK BOTH MODELS
+# ============================================================
+
+xai_results = benchmark_model(
+    model=xai_lite_model,
+    model_name="XAI-Lite",
+    sample_input=sample_input,
+    explanation_method=xai_gradcam
+)
+
+resnet_results = benchmark_model(
+    model=resnet50_model,
+    model_name="ResNet50 + Grad-CAM",
+    sample_input=sample_input,
+    explanation_method=resnet_gradcam
+)
+
+
+# ============================================================
+# 18. EVALUATE ACCURACY AND F1
+# ============================================================
+
+print("\nEvaluating XAI-Lite...")
+xai_metrics = evaluate_model(
+    xai_lite_model,
+    test_loader
+)
+
+print("XAI-Lite metrics:", xai_metrics)
+
+
+print("\nEvaluating ResNet50...")
+resnet_metrics = evaluate_model(
+    resnet50_model,
+    test_loader
+)
+
+print(
+    "ResNet50 metrics:",
+    resnet_metrics
+)
+
+
+# ============================================================
+# 19. COMBINE RESULTS
+# ============================================================
+
+xai_results.update({
+
+    "Accuracy_%":
+        xai_metrics["accuracy"] * 100,
+
+    "Macro_F1":
+        xai_metrics["macro_f1"],
+
+    "Weighted_F1":
+        xai_metrics["weighted_f1"]
+})
+
+
+resnet_results.update({
+
+    "Accuracy_%":
+        resnet_metrics["accuracy"] * 100,
+
+    "Macro_F1":
+        resnet_metrics["macro_f1"],
+
+    "Weighted_F1":
+        resnet_metrics["weighted_f1"]
+})
+
+
+results_df = pd.DataFrame([
+    xai_results,
+    resnet_results
+])
+
+
+# ============================================================
+# 20. SAVE RESULTS
+# ============================================================
+
+results_df.to_csv(
+    "benchmark_results.csv",
+    index=False
+)
+
+print("\n")
+print("=" * 70)
+print("FINAL RESULTS")
+print("=" * 70)
+
+print(
+    results_df.to_string(
+        index=False
+    )
+)
+
+print(
+    "\nResults saved to:"
+)
+
+print(
+    "benchmark_results.csv"
+)
+
+
+# ============================================================
+# 21. CLEAN UP HOOKS
+# ============================================================
+
+xai_gradcam.remove_hooks()
+
+resnet_gradcam.remove_hooks()
